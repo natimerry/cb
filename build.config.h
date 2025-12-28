@@ -1,11 +1,14 @@
-#include <stddef.h>
-#define _XOPEN_SOURCE 700
+#ifndef BUILD_CONFIG_H
+#define BUILD_CONFIG_H
+
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,21 +17,17 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-
-// Configuration
 #define CC "gcc"
 #define LINKER "gcc"
 #define CFLAGS "-Wall -Werror -ggdb"
 #define LIBS ""
-
 #define SELF_CC CC
 
-#define MAX_THREADS 8
+#define MAX_THREADS -1
 #define PRINT_COMPILATION_COMMANDS 0
 #define SHOW_UP_TO_DATE_MESSAGES 1
 #define VERBOSE_BUILD_INFO 1
 
-// Type definitions
 typedef struct Cmd {
   const char **args;
   size_t count;
@@ -44,11 +43,11 @@ struct Target {
   Target **parents;
   size_t parent_cnt;
   size_t parent_cap;
-  atomic_int pending_deps;
-  atomic_bool visited;
+  _Atomic int pending_deps;
+  _Atomic bool visited;
 
   int rebuild_needed;
-  pthread_mutex_t lock;
+  pthread_mutex_t lock; // pthread_mutex_t
 };
 
 typedef struct {
@@ -63,7 +62,6 @@ typedef struct {
   atomic_bool done;
 } Queue;
 
-// Macros
 #define panic(msg, ...)                                                        \
   do {                                                                         \
     fprintf(stderr, "Panic at %s:%d: \n>>> " msg "\n", __FILE__, __LINE__,     \
@@ -71,48 +69,34 @@ typedef struct {
     exit(1);                                                                   \
   } while (0)
 
-#define DEPS(...)                                                              \
-  (Target *[]) { __VA_ARGS__, NULL }
-
 #define CMD(...)                                                               \
   &(Cmd){.args = (const char *[]){__VA_ARGS__, NULL},                          \
          .count =                                                              \
              (sizeof((const char *[]){__VA_ARGS__}) / sizeof(const char *)),   \
-         .capacity = 0}
+         .capacity = 0};
 
-#define TARGET(name, out_file, deps_arr, cmd_ptr)                              \
-  Target name = {.output = (out_file), .deps = (deps_arr), .cmd = (cmd_ptr)}
+void cmd_internal_append(Cmd *cmd, ...);
+#define cmd_append(CMD, ...) cmd_internal_append(CMD, __VA_ARGS__, NULL)
+void cmd_extend(Cmd *cmd1, const Cmd *cmd2);
+Cmd *cmd_clone(const Cmd *src);
+Cmd *cmd_new(void);
+void cmd_print(const Cmd *cmd);
+int cmd_run(Cmd *cmd, const char *task_out, int task_num, size_t total_cmd);
 
-#define SOURCE(name, out_file)                                                 \
-  Target name = {.output = (out_file), .deps = NULL, .cmd = NULL}
+Target *src(const char *path);
+Target *target(const char *output, Cmd *cmd, ...);
+Target *obj(const char *obj_file, Cmd *compile_cmd, ...);
+Target *link_binary(const char *exe_name, Cmd *link_flags, ...);
 
-#define BINARY(name, output_file, sources, extra_deps, includes, linker,       \
-               ldflags)                                                        \
-  size_t name##_src_count = 0;                                                 \
-  while (sources[name##_src_count])                                            \
-    name##_src_count++;                                                        \
-  Target **name##_objs = malloc(sizeof(Target *) * name##_src_count);          \
-  for (size_t i = 0; i < name##_src_count; i++) {                              \
-    name##_objs[i] = create_obj_target(sources[i], extra_deps, CC, includes);  \
-  }                                                                            \
-  Target *name = create_link_target(output_file, name##_objs,                  \
-                                    name##_src_count, linker, ldflags)
+void add_dep(Target *t, Target *dep);
+void add_deps(Target *t, ...);
+bool remove_dep(Target *t, Target *dep);
+void clear_deps(Target *t);
+bool has_dep(Target *t, Target *dep);
+size_t dep_count(Target *t);
 
-// Forward declarations for functions used in main
 void rebuild_self(int argc, char **argv);
 void build_target(Target *root);
+time_t get_file_mtime(const char *path);
 
-// Helper functions for BINARY macro
-static inline char *obj_name_from_src(const char *src);
-static inline Target *create_source_target(const char *src);
-static inline Target *create_obj_target(const char *src, Target **extra_deps,
-                                        const char *compiler,
-                                        const char *includes);
-static inline Target *create_link_target(const char *output, Target **objs,
-                                         size_t obj_count, const char *linker,
-                                         const char *ldflags);
-
-// Global state
-static pthread_mutex_t build_lock = PTHREAD_MUTEX_INITIALIZER;
-static atomic_int completed_cmds = 0;
-static size_t total_nodes = 0;
+#endif // BUILD_CONFIG_H

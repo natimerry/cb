@@ -1,21 +1,27 @@
+#define _XOPEN_SOURCE 700
 #include "build.config.h"
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/utsname.h>
+
+static pthread_mutex_t build_lock = PTHREAD_MUTEX_INITIALIZER;
+static atomic_int completed_cmds = 0;
+static size_t total_nodes = 0;
+
 
 int main(int argc, char **argv) {
-  rebuild_self(argc, argv);
+    rebuild_self(argc, argv);
 
-  const char *exe_sources[] = {"src/game.c", "src/patcher.c", "src/main.c",
-                               "src/msg.c", NULL};
-  BINARY(exe,                      // Target variable name
-         "rivals_sig_patcher.exe", // Output file path
-         exe_sources,              // NULL-terminated source file array
-         NULL,                     // Dependencies (use DEPS() or NULL)
-         "-Iinclude",              // Include flags
-         NULL,                     // Linker command (NULL = use CC)
-         "-mconsole");             // LDFLAGS
+    return 0;
+}
 
-  build_target(exe);
-  return 0;
+Cmd* cmd_new(void) {
+    Cmd *cmd = calloc(1, sizeof(Cmd));
+    cmd->capacity = 8;
+    cmd->args = malloc(cmd->capacity * sizeof(char*));
+    return cmd;
 }
 
 time_t get_file_mtime(const char *path) {
@@ -24,12 +30,6 @@ time_t get_file_mtime(const char *path) {
     return 0;
   return attr.st_mtime;
 }
-
-void cmd_internal_append(Cmd *cmd, ...);
-#define cmd_append(CMD, ...) cmd_internal_append(CMD, __VA_ARGS__, NULL)
-
-void cmd_print(const Cmd *cmd);
-int cmd_run(Cmd *cmd, const char *task_out, int task_num, size_t total_cmd);
 
 bool need_self_rebuild(char *binpath) {
   const char *source_path = __FILE__;
@@ -55,6 +55,7 @@ bool need_self_rebuild(char *binpath) {
 
   return true;
 }
+
 void rebuild_self(int argc, char **argv) {
   if (!need_self_rebuild(argv[0])) {
     return;
@@ -76,10 +77,9 @@ void rebuild_self(int argc, char **argv) {
     panic("Could not rename old binary");
   }
 
-  Cmd cmd = {0};
-  cmd_append(&cmd, SELF_CC, __FILE__, "-o", argv[0]);
-
-  if (!cmd_run(&cmd, "build.c", 0, 0)) {
+  Cmd *cmd = CMD( SELF_CC, __FILE__, "-o", argv[0], "-lpthread");
+  
+  if (!cmd_run(cmd, "build.c", 0, 0)) {
     rename(old_binary_path, argv[0]);
     panic("Failed to rebuild build system");
   }
@@ -109,7 +109,7 @@ void cmd_internal_append(Cmd *cmd, ...) {
           (const char **)realloc(cmd->args, newsize * sizeof(char *));
 
       if (!new_items)
-        panic("Out of memory");
+        panic("get more ram");
 
       cmd->args = new_items;
       cmd->capacity = newsize;
@@ -214,19 +214,17 @@ Target *queue_pop(Queue *q) {
   return t;
 }
 
-void add_parent(Target *child, Target *parent) {
-  pthread_mutex_lock(&child->lock);
-
-  if (child->parent_cnt == child->parent_cap) {
-    child->parent_cap = (child->parent_cap == 0) ? 4 : child->parent_cap * 2;
-    child->parents =
-        realloc(child->parents, child->parent_cap * sizeof(Target *));
-    if (!child->parents)
-      panic("Out of memory allocating parent array");
-  }
-
-  child->parents[child->parent_cnt++] = parent;
-  pthread_mutex_unlock(&child->lock);
+static void add_parent(Target *child, Target *parent) {
+    pthread_mutex_lock(&child->lock); 
+    
+    if (child->parent_cnt == child->parent_cap) {
+        child->parent_cap = (child->parent_cap == 0) ? 4 : child->parent_cap * 2;
+        child->parents = realloc(child->parents, child->parent_cap * sizeof(Target *));
+        if (!child->parents) panic("Out of memory allocating parent array");
+    }
+    
+    child->parents[child->parent_cnt++] = parent;
+    pthread_mutex_unlock(&child->lock);  
 }
 
 void analyze_graph(Target *t, size_t *total_nodes, size_t *cnt_cmd) {
@@ -268,7 +266,7 @@ void reset_target_state(Target *t) {
     t->parent_cap = 0;
   }
 
-  if (t->lock.__data.__kind != 0) {
+  if (t->lock.__data.__kind != 0) { // very hacky
     pthread_mutex_destroy(&t->lock);
   }
 
@@ -412,88 +410,108 @@ void build_target(Target *root) {
   pthread_mutex_unlock(&build_lock);
 }
 
-// Helper functions for BINARY macro
-static inline char *obj_name_from_src(const char *src) {
-  const char *last_slash = strrchr(src, '/');
-  const char *basename = last_slash ? last_slash + 1 : src;
-  const char *dot = strrchr(basename, '.');
-  size_t len = dot ? (size_t)(dot - basename) : strlen(basename);
-  char *obj = malloc(len + 3);
-  memcpy(obj, basename, len);
-  obj[len] = '.';
-  obj[len + 1] = 'o';
-  obj[len + 2] = '\0';
-  return obj;
+
+
+
+int cmd_run(Cmd *cmd, const char *task_out, int task_num, size_t total_cmd);
+
+static inline char* str_clone(const char *s) {
+    if (!s) return NULL;
+    size_t len = strlen(s);
+    char *clone = malloc(len + 1);
+    memcpy(clone, s, len + 1);
+    return clone;
 }
 
-static inline Target *create_source_target(const char *src) {
-  Target *t = malloc(sizeof(Target));
-  memset(t, 0, sizeof(Target));
-  t->output = src;
-  t->deps = NULL;
-  t->cmd = NULL;
-  return t;
+void cmd_extend(Cmd *cmd1, const Cmd *cmd2) {
+    if (!cmd1 || !cmd2) panic("cmd_extend: null pointer");
+    
+    for (size_t i = 0; i < cmd2->count; i++) {
+        if (cmd1->count >= cmd1->capacity) {
+            cmd1->capacity = cmd1->capacity * 2;
+            cmd1->args = realloc(cmd1->args, cmd1->capacity * sizeof(char*));
+        }
+        cmd1->args[cmd1->count++] = str_clone(cmd2->args[i]);
+    }
 }
 
-static inline Target *create_obj_target(const char *src, Target **extra_deps,
-                                        const char *compiler,
-                                        const char *includes) {
-  Target *obj = malloc(sizeof(Target));
-  memset(obj, 0, sizeof(Target));
-  obj->output = obj_name_from_src(src);
-
-  // Count extra deps
-  size_t dep_cnt = 1;
-  if (extra_deps) {
-    while (extra_deps[dep_cnt - 1])
-      dep_cnt++;
-  }
-
-  // Build deps array
-  Target **deps = malloc(sizeof(Target *) * (dep_cnt + 1));
-  deps[0] = create_source_target(src);
-  if (extra_deps) {
-    memcpy(deps + 1, extra_deps, sizeof(Target *) * (dep_cnt - 1));
-  }
-  deps[dep_cnt] = NULL;
-  obj->deps = deps;
-
-  // Build compile command
-  Cmd *cmd = malloc(sizeof(Cmd));
-  memset(cmd, 0, sizeof(Cmd));
-  cmd_append(cmd, compiler, includes, "-c", src, "-o", obj->output);
-  obj->cmd = cmd;
-
-  return obj;
+Cmd* cmd_clone(const Cmd *src) {
+    if (!src) return NULL;
+    
+    Cmd *dst = calloc(1, sizeof(Cmd));
+    dst->capacity = src->count + 4;
+    dst->args = malloc(dst->capacity * sizeof(char*));
+    
+    for (size_t i = 0; i < src->count; i++) {
+        dst->args[dst->count++] = str_clone(src->args[i]);
+    }
+    
+    return dst;
 }
 
-static inline Target *create_link_target(const char *output, Target **objs,
-                                         size_t obj_count, const char *linker,
-                                         const char *ldflags) {
-  Target *exe = malloc(sizeof(Target));
-  memset(exe, 0, sizeof(Target));
-  exe->output = output;
 
-  // Set deps to object files
-  Target **deps = malloc(sizeof(Target *) * (obj_count + 1));
-  memcpy(deps, objs, sizeof(Target *) * obj_count);
-  deps[obj_count] = NULL;
-  exe->deps = deps;
 
-  // Use CC if linker not specified
-  const char *link_cmd = (linker && strlen(linker) > 0) ? linker : CC;
-
-  Cmd *cmd = malloc(sizeof(Cmd));
-  memset(cmd, 0, sizeof(Cmd));
-  cmd_append(cmd, link_cmd);
-  for (size_t i = 0; i < obj_count; i++) {
-    cmd_append(cmd, objs[i]->output);
-  }
-  cmd_append(cmd, "-o", output);
-  if (ldflags && strlen(ldflags) > 0) {
-    cmd_append(cmd, ldflags);
-  }
-  exe->cmd = cmd;
-
-  return exe;
+Target* src(const char *path) {
+    Target *t = calloc(1, sizeof(Target));
+    t->output = path;
+    return t;
 }
+
+Target* target(const char *output, Cmd *cmd, ...) {
+    Target *t = calloc(1, sizeof(Target));
+    t->output = output;
+    t->cmd = cmd;
+    size_t dep_count = 0;
+    va_list args;
+    va_start(args, cmd);
+    while (va_arg(args, Target*) != NULL) dep_count++;
+    va_end(args);
+    
+    if (dep_count > 0) {
+        t->deps = malloc((dep_count + 1) * sizeof(Target*));
+        va_start(args, cmd);
+        for (size_t i = 0; i < dep_count; i++) {
+            t->deps[i] = va_arg(args, Target*);
+        }
+        va_end(args);
+        t->deps[dep_count] = NULL;
+    }
+    
+    return t;
+}
+
+Target* obj(const char *obj_file, Cmd *compile_cmd, ...) {
+    const char *dot = strrchr(obj_file, '.');
+    size_t base_len = dot ? (size_t)(dot - obj_file) : strlen(obj_file);
+    
+    char *src_file = malloc(base_len + 3);
+    memcpy(src_file, obj_file, base_len);
+    strcpy(src_file + base_len, ".c");
+    
+    // Count extra deps
+    size_t extra_count = 0;
+    va_list args;
+    va_start(args, compile_cmd);
+    while (va_arg(args, Target*) != NULL) extra_count++;
+    va_end(args);
+    
+    Target *t = calloc(1, sizeof(Target));
+    t->output = obj_file;
+    t->cmd = compile_cmd;
+    
+    // Deps = [source, ...extras]
+    t->deps = malloc((extra_count + 2) * sizeof(Target*));
+    t->deps[0] = src(src_file);
+    
+    if (extra_count > 0) {
+        va_start(args, compile_cmd);
+        for (size_t i = 0; i < extra_count; i++) {
+            t->deps[i + 1] = va_arg(args, Target*);
+        }
+        va_end(args);
+    }
+    t->deps[extra_count + 1] = NULL;
+    
+    return t;
+}
+
