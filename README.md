@@ -1,425 +1,360 @@
-# Build System
+# Build System (CB)
 
-A parallel build system written in C with automatic dependency tracking, file globbing, and self-rebuilding capabilities.
+A **parallel, dependency-aware build system written in C**, inspired by `build.c` / `nob`, with explicit targets, automatic incremental rebuilds, file globbing, and self-rebuilding.
+
+This is **not Make**, **not CMake**, and **not a DSL**.
+You write C. The build graph is explicit. The behavior is predictable.
+
+This project assumes that build logic is part of the program, not a separate domain that needs its own language.
+---
+
+## Design Goals
+
+* Deterministic builds
+* Explicit dependency graphs
+* Parallel execution
+* No external configuration language
+* No magic dependency inference
+* Easy to debug (it’s just C)
+
+---
+
+## Non-Goals (Important)
+
+* No compiler-driven dependency scanning (`-MMD`)
+* No automatic header parsing
+* No implicit rules
+* No platform abstraction layer beyond POSIX
+
+If you want those, use Ninja + a generator. This tool is intentionally lower-level.
+
+---
 
 ## Requirements
 
-- GCC or Clang
-- POSIX-compliant system (Linux, BSD, macOS)
-- pthread library
+* GCC or Clang
+* POSIX-compliant system (Linux, BSD, macOS)
+* `pthread`
 
-## Building
+---
 
-Compile the build system:
+## Building the Build System
 
-```bash
+```sh
 gcc build.c build.impl.c -o build -lpthread
 ```
 
-The build system automatically rebuilds itself when modified.
+The build system **rebuilds itself automatically** if its sources change.
 
-## Usage
+---
 
-Run the build system to compile all targets:
+## Running
 
-```bash
+```sh
 ./build
 ```
 
-## Quick Start
+---
 
-Create a simple `build.c`:
+## Core Concepts
+
+### Targets
+
+A `Target` represents **one output file**.
+
+* It may have:
+
+  * a command (`Cmd`)
+  * dependencies (`Target*`)
+* Dependencies are built **before** the target
+* Targets are built **once**, even in diamond graphs
+
+---
+
+### Source Targets
+
+A source file is a target with **no build command**:
+
+```c
+Target *main_c = src("src/main.c");
+```
+
+This allows it to participate in dependency graphs.
+
+---
+
+### Command Objects
+
+Commands are immutable argument vectors.
+
+```c
+Cmd *compile = CMD(CC, "-c", "main.c", "-o", "main.o", "-O2");
+```
+
+Commands can also be built incrementally:
+
+```c
+Cmd *cmd = cmd_new();
+cmd_append(cmd, CC, "-c", "main.c", "-o", "main.o", NULL);
+cmd_append(cmd, "-Wall", "-Wextra", "-O2", NULL);
+```
+
+You can clone and extend commands safely:
+
+```c
+Cmd *base = CMD(CC, "-c");
+Cmd *flags = CMD("-O2", "-Wall");
+
+Cmd *c1 = cmd_clone(base);
+cmd_extend(c1, flags);
+cmd_append(c1, "a.c", "-o", "a.o", NULL);
+```
+
+---
+
+## Minimal Example
 
 ```c
 #include "build.config.h"
-#include <stdio.h>
 
 int main(int argc, char **argv) {
     rebuild_self(argc, argv);
 
-    printf("Building myproject...\n\n");
-
     ensure_dir("build");
 
-    // Compile objects
     Target *main_o = target("build/main.o",
         CMD(CC, "-c", "src/main.c", "-o", "build/main.o", "-O2"),
+        src("src/main.c"),
         NULL);
 
-    Target *utils_o = target("build/utils.o",
-        CMD(CC, "-c", "src/utils.c", "-o", "build/utils.o", "-O2"),
+    Target *util_o = target("build/util.o",
+        CMD(CC, "-c", "src/util.c", "-o", "build/util.o", "-O2"),
+        src("src/util.c"),
         NULL);
 
-    // Link binary
-    Target *myapp = target("build/myapp",
-        CMD(CC, "build/main.o", "build/utils.o", "-o", "build/myapp", "-lm"),
-        main_o, utils_o, NULL);
+    Target *app = target("build/app",
+        CMD(CC, "build/main.o", "build/util.o", "-o", "build/app"),
+        main_o, util_o, NULL);
 
-    build_target(myapp);
-
-    printf("\nBuild complete: build/myapp\n");
-    return 0;
+    build_target(app);
 }
 ```
 
-## Configuration
+---
 
-Edit `build.config.h` for global settings:
+## Ergonomic Macros (Recommended)
+
+You are expected to add **project-local macros** for sanity.
+
+### Object Rule Macro
+
+```c
+#define OBJ(out, srcfile, ...) \
+    target(out, \
+           CMD(CC, "-c", srcfile, "-o", out), \
+           src(srcfile), \
+           __VA_ARGS__, \
+           NULL)
+```
+
+Usage:
+
+```c
+Target *main_o =
+    OBJ("build/main.o",
+        "src/main.c",
+        src("include/main.h"));
+```
+
+---
+
+### Grouping Headers
+
+```c
+#define COMMON_HDRS \
+    src("include/common.h"), \
+    src("include/config.h")
+
+Target *util_o =
+    OBJ("build/util.o",
+        "src/util.c",
+        COMMON_HDRS);
+```
+
+This avoids copy-paste dependency lists.
+
+---
+
+## Dependency Manipulation API
+
+Dependencies are **first-class and mutable**.
+
+```c
+add_dep(obj, config_h);
+add_deps(obj, h1, h2, h3, NULL);
+
+remove_dep(obj, old_dep);
+clear_deps(obj);
+
+if (has_dep(obj, config_h)) { ... }
+
+size_t n = dep_count(obj);
+```
+
+This is useful for:
+
+* conditional features
+* generated files
+* platform-specific builds
+
+---
+
+## File Globbing
+
+Globbing is explicit and returns **heap-allocated lists**.
+
+```c
+char **sources = glob_files("src", ".c");
+
+for (int i = 0; sources[i]; i++) {
+    printf("%s\n", sources[i]);
+}
+
+free_glob(sources);
+```
+
+No automatic target creation is done for you.
+
+---
+
+## Example: Compile All `.c` Files
+
+```c
+char **sources = glob_files("src", ".c");
+
+int count = 0;
+while (sources[count]) count++;
+
+Target **objs = malloc(sizeof(Target*) * count);
+
+for (int i = 0; i < count; i++) {
+    char obj[256];
+    snprintf(obj, sizeof(obj), "build/%d.o", i);
+
+    objs[i] = target(strdup(obj),
+        CMD(CC, "-c", sources[i], "-o", obj, "-O2"),
+        src(sources[i]),
+        NULL);
+}
+```
+
+---
+
+## Example: Generated Headers
+
+```c
+Target *config_h =
+    target("build/config.h",
+        CMD("sh", "-c", "scripts/gen_config.sh > build/config.h"),
+        src("scripts/gen_config.sh"),
+        NULL);
+
+add_dep(main_o, config_h);
+add_dep(util_o, config_h);
+```
+
+Generated files behave like normal targets.
+
+---
+
+## Parallelism
+
+* Uses a thread pool
+* Maximum threads configurable
+* `MAX_THREADS = 0` auto-detects CPU count
+* Dependency ordering is respected
+
+---
+
+## Diamond Dependencies
+
+If multiple targets depend on the same target:
+
+```text
+A
+├── B
+│   └── D
+└── C
+    └── D
+```
+
+`D` is built **once**, correctly.
+
+---
+
+## Self-Rebuilding
+
+```c
+rebuild_self(argc, argv);
+```
+
+If the build system source changes:
+
+* it recompiles itself
+* re-execs automatically
+
+No manual bootstrapping required.
+
+---
+
+## Configuration (`build.config.h`)
 
 ```c
 #define CC "gcc"
 #define LINKER "gcc"
 #define SELF_CC CC
-#define MAX_THREADS 0  // 0 = auto-detect CPU cores
+#define MAX_THREADS 0
 ```
 
-## API Reference
-
-### Creating Targets
-
-**Source files** (no build command):
-
-```c
-Target *main_src = src("src/main.c");
-```
-
-**Compiled targets** with dependencies:
-
-```c
-Target *config_h = target("include/config.h",
-    CMD("sh", "-c", "sed 's/@VERSION@/1.0/g' config.h.in > config.h"),
-    src("config.h.in"), NULL);
-```
-
-**Build the target**:
-
-```c
-build_target(myapp);
-```
-
-### Commands
-
-**Create command** using CMD macro:
-
-```c
-Cmd *compile = CMD(CC, "-c", "main.c", "-o", "main.o", "-Wall");
-```
-
-**Dynamic commands**:
-
-```c
-Cmd *compile = cmd_new();
-cmd_append(compile, CC, "-c", "main.c", "-o", "main.o", NULL);
-cmd_append(compile, "-Wall", "-Wextra", NULL);
-```
-
-**Clone commands**:
-
-```c
-Cmd *base = CMD(CC, "-c", "-O2", "-Wall");
-Cmd *compile1 = cmd_clone(base);
-cmd_append(compile1, "main.c", "-o", "main.o", NULL);
-```
-
-**Extend commands**:
-
-```c
-Cmd *base_flags = CMD("-Wall", "-Wextra", "-std=c11");
-Cmd *compile = cmd_new();
-cmd_append(compile, CC, "-c", "main.c", "-o", "main.o", NULL);
-cmd_extend(compile, base_flags);
-```
-
-### File Globbing
-
-**Glob files in directory**:
-
-```c
-char **c_sources = glob_files("src", ".c");
-char **cpp_sources = glob_files("src", ".cpp");
-char **headers = glob_files("include", ".h");
-
-// Use the files...
-
-// Free when done
-free_glob(c_sources);
-free_glob(cpp_sources);
-free_glob(headers);
-```
-
-**Create directory if it doesn't exist**:
-
-```c
-ensure_dir("build");
-ensure_dir("output/bin");
-```
-
-### Dependency Manipulation
-
-**Add single dependency**:
-
-```c
-Target *obj = target("main.o", compile_cmd, NULL);
-add_dep(obj, config_h);
-add_dep(obj, version_h);
-```
-
-**Add multiple dependencies at once**:
-
-```c
-add_deps(obj, header1, header2, header3, NULL);
-```
-
-**Check if dependency exists**:
-
-```c
-if (has_dep(obj, config_h)) {
-    printf("main.o depends on config.h\n");
-}
-```
-
-**Count dependencies**:
-
-```c
-size_t count = dep_count(obj);
-printf("main.o has %zu dependencies\n", count);
-```
-
-**Remove specific dependency**:
-
-```c
-if (remove_dep(obj, old_header)) {
-    printf("Removed old_header dependency\n");
-}
-```
-
-**Clear all dependencies**:
-
-```c
-clear_deps(obj);  // Removes all dependencies
-```
-
-## Complete Example with Globbing
-
-```c
-#include "build.config.h"
-#include <stdio.h>
-#include <string.h>
-
-int main(int argc, char **argv) {
-    rebuild_self(argc, argv);
-
-    printf("Building project...\n\n");
-
-    ensure_dir("build");
-
-    // Glob all source files
-    char **c_sources = glob_files("src", ".c");
-    if (!c_sources || !c_sources[0]) {
-        panic("No source files found in src/");
-    }
-
-    // Count sources
-    int count = 0;
-    while (c_sources[count]) count++;
-    printf("Found %d source files\n\n", count);
-
-    // Generate config header
-    Target *config_h = target("build/config.h",
-        CMD("sh", "scripts/generate_config.sh"),
-        NULL);
-
-    // Compile all sources
-    Target **objs = malloc(count * sizeof(Target*));
-    
-    for (int i = 0; i < count; i++) {
-        const char *src = c_sources[i];
-        
-        // Extract basename
-        char *base = strrchr(src, '/');
-        base = base ? base + 1 : (char*)src;
-        
-        // Create object path
-        char *obj = malloc(256);
-        snprintf(obj, 256, "build/%s", base);
-        char *dot = strrchr(obj, '.');
-        strcpy(dot, ".o");
-        
-        // Create compile command
-        Cmd *compile = cmd_new();
-        cmd_append(compile, CC, "-c", src, "-o", obj, NULL);
-        cmd_append(compile, "-Wall", "-Wextra", "-O2", "-Iinclude", NULL);
-        
-        // Create target without dependencies first
-        objs[i] = target(obj, compile, NULL);
-        
-        // Add config.h as dependency to all objects
-        add_dep(objs[i], config_h);
-        
-        // Check for matching header and add as dependency
-        char header_path[256];
-        snprintf(header_path, sizeof(header_path), "include/%s", base);
-        dot = strrchr(header_path, '.');
-        if (dot) strcpy(dot, ".h");
-        
-        struct stat st;
-        if (stat(header_path, &st) == 0) {
-            add_dep(objs[i], src(header_path));
-            printf("Added %s as dependency for %s\n", header_path, obj);
-        }
-    }
-
-    // Link binary
-    Cmd *link = cmd_new();
-    cmd_append(link, CC, "-o", "build/myapp", NULL);
-    
-    for (int i = 0; i < count; i++) {
-        cmd_append(link, objs[i]->output, NULL);
-    }
-    
-    cmd_append(link, "-lm", "-lpthread", NULL);
-
-    // Create final target
-    Target *myapp = calloc(1, sizeof(Target));
-    myapp->output = "build/myapp";
-    myapp->cmd = link;
-    myapp->deps = NULL;
-    
-    // Add all object files as dependencies
-    for (int i = 0; i < count; i++) {
-        add_dep(myapp, objs[i]);
-    }
-    
-    printf("\nBuilding %zu targets...\n", dep_count(myapp));
-
-    build_target(myapp);
-
-    free_glob(c_sources);
-
-    printf("\nBuild complete: build/myapp\n");
-    return 0;
-}
-```
-
-## Simple Globbing Example
-
-For projects with straightforward structure:
-
-```c
-#include "build.config.h"
-#include <stdio.h>
-
-int main(int argc, char **argv) {
-    rebuild_self(argc, argv);
-
-    ensure_dir("build");
-
-    // Glob all C files
-    char **sources = glob_files("src", ".c");
-    
-    int count = 0;
-    while (sources[count]) count++;
-
-    // Compile each file
-    Target **objs = malloc(count * sizeof(Target*));
-    for (int i = 0; i < count; i++) {
-        char obj[256];
-        snprintf(obj, sizeof(obj), "build/%s.o", sources[i]);
-        
-        objs[i] = target(strdup(obj),
-            CMD(CC, "-c", sources[i], "-o", obj, "-O2"),
-            NULL);
-    }
-
-    // Link
-    Cmd *link = cmd_new();
-    cmd_append(link, CC, "-o", "build/app", NULL);
-    for (int i = 0; i < count; i++) {
-        cmd_append(link, objs[i]->output, NULL);
-    }
-    cmd_append(link, "-lm", NULL);
-
-    Target *app = calloc(1, sizeof(Target));
-    app->output = "build/app";
-    app->cmd = link;
-    app->deps = NULL;
-    
-    for (int i = 0; i < count; i++) {
-        add_dep(app, objs[i]);
-    }
-
-    build_target(app);
-    free_glob(sources);
-
-    printf("\nDone!\n");
-    return 0;
-}
-```
-
-## Features
-
-- **Parallel builds** using all available CPU cores
-- **Incremental rebuilds** based on modification time
-- **Automatic dependency resolution** with topological ordering
-- **Self-rebuilding** when build files change
-- **File globbing** for automatic source discovery
-- **Dynamic dependency management** with add/remove functions
-- **Diamond dependency detection** - shared dependencies built once
-- **Thread-safe** build queue with atomic operations
-- **Zero configuration** - works out of the box
-
-## Advanced Usage
-
-### Cross-Compilation
+For cross-compilation:
 
 ```c
 #define CC "x86_64-w64-mingw32-gcc"
-#define LINKER "x86_64-w64-mingw32-gcc"
-#define SELF_CC "gcc"  // Use native compiler for build system
+#define LINKER CC
+#define SELF_CC "gcc"
 ```
 
-### Conditional Dependencies
+---
 
-```c
-Target *main_o = target("main.o", compile_cmd, NULL);
+## Debugging Philosophy
 
-#ifdef USE_SSL
-    add_dep(main_o, ssl_lib);
-#endif
+This system is designed to be debugged with:
 
-#ifdef ENABLE_LOGGING
-    add_deps(main_o, log_header, log_impl, NULL);
-#endif
-```
+* `printf`
+* `gdb`
+* reading the source
 
-### Cleaning Build Artifacts
+There is **no opaque runtime**, no hidden state machine, and no generator step.
 
-```c
-// Remove dependency on old config
-if (has_dep(main_o, old_config)) {
-    remove_dep(main_o, old_config);
-    add_dep(main_o, new_config);
-}
+---
 
-// Start fresh
-Target *test_o = target("test.o", cmd, NULL);
-clear_deps(test_o);  // Remove all deps
-add_deps(test_o, test_h, mock_h, NULL);  // Add only what's needed
-```
+## When This Tool Makes Sense
 
-### Building External Dependencies
+* Small–medium C/C++ projects
+* Custom build logic
+* Tooling experiments
+* Systems programming projects
+* Replacing ad-hoc Makefiles
 
-```c
-Target *lua_lib = target("deps/lua/src/liblua.a",
-    CMD("sh", "-c", "cd deps/lua && make linux"),
-    NULL);
+## When It Does Not
 
-// Add to all objects that need it
-for (int i = 0; i < obj_count; i++) {
-    add_dep(objs[i], lua_lib);
-}
-```
+* Huge multi-platform SDKs
+* IDE-driven workflows
+* Projects requiring automatic header scanning
+* Teams expecting CMake semantics
+
+---
 
 ## License
 
-See LICENSE file for details.
+See `LICENSE`.
