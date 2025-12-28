@@ -1,6 +1,6 @@
 #include <dirent.h>
 #define _XOPEN_SOURCE 700
-#include "build.config.h"
+#include "cb.config.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>

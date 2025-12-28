@@ -41,7 +41,7 @@ If you want those, use Ninja + a generator. This tool is intentionally lower-lev
 ## Building the Build System
 
 ```sh
-gcc build.c build.impl.c -o build -lpthread
+gcc cb.c -o cb -lpthread
 ```
 
 The build system **rebuilds itself automatically** if its sources change.
